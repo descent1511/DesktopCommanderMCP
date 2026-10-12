@@ -57,6 +57,10 @@ import {
     ListSearchesArgsSchema,
     GetRecentToolCallsArgsSchema,
     WritePdfArgsSchema,
+    KubernetesReadArgsSchema,
+    KubernetesMutateArgsSchema,
+    DatabaseReadArgsSchema,
+    DatabaseMutateArgsSchema,
     toolArgSchemas,
 } from './tools/schemas.js';
 import {
@@ -67,6 +71,8 @@ import {
 import { getConfig, setConfigValue } from './tools/config.js';
 import { getUsageStats } from './tools/usage.js';
 import { giveFeedbackToDesktopCommander } from './tools/feedback.js';
+import { handleKubernetesMutate, handleKubernetesRead } from './tools/kubernetes.js';
+import { handleDatabaseMutate, handleDatabaseRead } from './tools/database.js';
 import { trackToolCall } from './utils/trackTools.js';
 import { usageTracker } from './utils/usageTracker.js';
 import { processDockerPrompt } from './utils/dockerPrompt.js';
@@ -1079,6 +1085,110 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 },
             },
             {
+                name: "kubernetes_read",
+                description: `
+                        Run a read-only kubectl command against the local Mac Kubernetes credentials.
+
+                        This is a controlled bridge to the explicitly selected context alias: 'uat' or 'prod'.
+                        The local kubeconfig, AWS credentials, and cluster network stay on the Mac and are never
+                        mounted into the ChatGPT container.
+
+                        Read-only command families include: get, describe, logs, top, events, explain,
+                        api-resources, api-versions, cluster-info, auth, and version.
+                        Put the kubectl verb first in args, for example ["get", "pods", "-A"].
+                        Do not pass --context, --kubeconfig, --server, --token, or impersonation flags.
+
+                        Use kubernetes_mutate for apply, create, patch, replace, delete, rollout, scale, exec,
+                        attach, cp, port-forward, drain, cordon, and any other non-read-only operation.
+
+                        ${CMD_PREFIX_DESCRIPTION}`,
+                inputSchema: zodToJsonSchema(KubernetesReadArgsSchema),
+                annotations: {
+                    title: "Read Kubernetes",
+                    readOnlyHint: true,
+                    openWorldHint: false,
+                    destructiveHint: false,
+                },
+            },
+            {
+                name: "kubernetes_mutate",
+                description: `
+                        Run a full-permission kubectl command against the local Mac Kubernetes credentials.
+
+                        SAFETY REQUIREMENT: This tool can change or delete cluster resources and can execute
+                        commands in pods. The ChatGPT client must ask the user to confirm the exact context and
+                        command before calling it. Set confirm=true only after the user explicitly confirms;
+                        confirm=false (or omitting confirmation) executes nothing and returns a confirmation prompt.
+
+                        This covers apply, create, patch, replace, delete, rollout, scale, label, annotate,
+                        taint, cordon, drain, exec, attach, cp, port-forward, and other non-read-only kubectl
+                        operations. The bridge still fixes the context to 'uat' or 'prod' and blocks kubeconfig,
+                        server, token, and impersonation overrides.
+
+                        ${CMD_PREFIX_DESCRIPTION}`,
+                inputSchema: zodToJsonSchema(KubernetesMutateArgsSchema),
+                annotations: {
+                    title: "Change Kubernetes (confirmation required)",
+                    readOnlyHint: false,
+                    openWorldHint: false,
+                    destructiveHint: true,
+                },
+            },
+            {
+                name: "database_read",
+                description: `
+                        Run a read-only query against a database reachable from a Kubernetes pod.
+
+                        The bridge uses the Mac's local kubeconfig and retrieves the named Kubernetes
+                        Secret locally; credential values are never returned to ChatGPT. K9s is a UI
+                        over the same Kubernetes access, so provide the Secret name shown there rather
+                        than copying a password into chat.
+
+                        Supported engines: postgres, mysql, redis. The query runs inside the selected pod
+                        using its native client (psql, mysql, or redis-cli), with the target host defaulting
+                        to 127.0.0.1 unless host or a host Secret key is supplied.
+
+                        Only clearly read-only SQL (SELECT/SHOW/DESCRIBE/EXPLAIN) and a safe Redis read
+                        command set are accepted here. Use database_mutate for writes, deletes, DDL,
+                        transactions, scripts, or ambiguous statements.
+
+                        Required fields: context, namespace, pod, engine, secret, query.
+                        Secret key defaults are username/password/database/host/port and can be overridden
+                        with username_key, password_key, database_key, host_key, and port_key.
+
+                        ${CMD_PREFIX_DESCRIPTION}`,
+                inputSchema: zodToJsonSchema(DatabaseReadArgsSchema),
+                annotations: {
+                    title: "Read Database",
+                    readOnlyHint: true,
+                    openWorldHint: false,
+                    destructiveHint: false,
+                },
+            },
+            {
+                name: "database_mutate",
+                description: `
+                        Run a full-permission database operation from a Kubernetes pod.
+
+                        SAFETY REQUIREMENT: This tool can insert, update, delete, drop, alter, flush,
+                        or otherwise change data. The ChatGPT client must ask the user to confirm the exact
+                        context, pod, engine, and query before calling it. Set confirm=true only after the
+                        user explicitly confirms; confirm=false (or omitting confirmation) executes nothing.
+
+                        Credentials are loaded locally from the named Kubernetes Secret and are not returned
+                        to ChatGPT. Supported engines are postgres, mysql, and redis. The query is passed as
+                        argv to the database client; no shell is used.
+
+                        ${CMD_PREFIX_DESCRIPTION}`,
+                inputSchema: zodToJsonSchema(DatabaseMutateArgsSchema),
+                annotations: {
+                    title: "Change Database (confirmation required)",
+                    readOnlyHint: false,
+                    openWorldHint: false,
+                    destructiveHint: true,
+                },
+            },
+            {
                 name: "get_usage_stats",
                 description: `
                         Get usage statistics for debugging and analysis.
@@ -1355,6 +1465,23 @@ async function handleCallToolRequest(request: CallToolRequest): Promise<ServerRe
 
             case "kill_process":
                 result = await handlers.handleKillProcess(args);
+                break;
+
+            // Kubernetes bridge tools
+            case "kubernetes_read":
+                result = await handleKubernetesRead(args);
+                break;
+
+            case "kubernetes_mutate":
+                result = await handleKubernetesMutate(args);
+                break;
+
+            case "database_read":
+                result = await handleDatabaseRead(args);
+                break;
+
+            case "database_mutate":
+                result = await handleDatabaseMutate(args);
                 break;
 
             // Note: REPL functionality removed in favor of using general terminal commands

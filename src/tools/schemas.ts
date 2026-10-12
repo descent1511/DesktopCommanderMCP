@@ -243,6 +243,55 @@ export const TrackUiEventArgsSchema = z.object({
   params: z.record(z.union([z.string(), z.number(), z.boolean(), z.null()])).optional().default({}),
 });
 
+// Kubernetes bridge schemas.  The context is deliberately an alias instead
+// of an arbitrary kubeconfig context so ChatGPT cannot switch to an unknown
+// cluster or inject a different kubeconfig/server/token.
+const KubernetesContextSchema = z.enum(['uat', 'prod']);
+const KubernetesArgvSchema = z.array(z.string().min(1).max(2048)).min(1).max(80);
+const KubernetesTimeoutSchema = z.number().int().min(1000).max(120000).optional().default(30000);
+
+export const KubernetesReadArgsSchema = z.object({
+  context: KubernetesContextSchema,
+  args: KubernetesArgvSchema,
+  timeout_ms: KubernetesTimeoutSchema,
+});
+
+export const KubernetesMutateArgsSchema = z.object({
+  context: KubernetesContextSchema,
+  args: KubernetesArgvSchema,
+  timeout_ms: KubernetesTimeoutSchema,
+  // The client should display a destructive confirmation before it sends true.
+  confirm: z.boolean().describe('Must be true only after the user explicitly confirms this Kubernetes change.'),
+});
+
+const KubernetesNameSchema = z.string().min(1).max(253).regex(/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/, 'must be a Kubernetes resource name');
+const DatabaseEngineSchema = z.enum(['postgres', 'mysql', 'redis']);
+const DatabaseCommonArgsSchema = {
+  context: KubernetesContextSchema,
+  namespace: KubernetesNameSchema.default('default'),
+  pod: KubernetesNameSchema,
+  container: KubernetesNameSchema.optional(),
+  engine: DatabaseEngineSchema,
+  secret: KubernetesNameSchema,
+  query: z.string().min(1).max(100000),
+  host: z.string().min(1).max(253).optional(),
+  port: z.number().int().min(1).max(65535).optional(),
+  username_key: z.string().max(128).default('username'),
+  password_key: z.string().max(128).default('password'),
+  database_key: z.string().max(128).default('database'),
+  host_key: z.string().max(128).default('host'),
+  port_key: z.string().max(128).default('port'),
+  timeout_ms: KubernetesTimeoutSchema,
+};
+
+export const DatabaseReadArgsSchema = z.object(DatabaseCommonArgsSchema);
+
+export const DatabaseMutateArgsSchema = z.object({
+  ...DatabaseCommonArgsSchema,
+  // The client should display a destructive confirmation before it sends true.
+  confirm: z.boolean().describe('Must be true only after the user explicitly confirms this database change.'),
+});
+
 /**
  * Map of tool name -> argument schema, used by the dispatcher to detect and warn
  * about parameters a caller sent that the tool does not support. Keep in sync
@@ -275,4 +324,8 @@ export const toolArgSchemas: Record<string, z.ZodTypeAny> = {
   get_recent_tool_calls: GetRecentToolCallsArgsSchema,
   give_feedback_to_desktop_commander: GiveFeedbackArgsSchema,
   track_ui_event: TrackUiEventArgsSchema,
+  kubernetes_read: KubernetesReadArgsSchema,
+  kubernetes_mutate: KubernetesMutateArgsSchema,
+  database_read: DatabaseReadArgsSchema,
+  database_mutate: DatabaseMutateArgsSchema,
 };
