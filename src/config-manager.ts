@@ -229,6 +229,14 @@ class ConfigManager {
    * Create default configuration
    */
   private getDefaultConfig(): ServerConfig {
+    const configuredAllowedDirectories = process.env.DESKTOP_COMMANDER_ALLOWED_DIRECTORIES
+      ?.split(path.delimiter)
+      .map((directory) => directory.trim())
+      .filter(Boolean);
+    const hardenedMode = ['1', 'true', 'yes', 'on'].includes(
+      (process.env.DESKTOP_COMMANDER_HARDENED || '').trim().toLowerCase()
+    );
+
     return {
       blockedCommands: [
 
@@ -276,8 +284,8 @@ class ConfigManager {
         "takeown"    // Take ownership of files
       ],
       defaultShell: getDefaultShell(),
-      allowedDirectories: [],
-      telemetryEnabled: true, // Default to opt-out approach (telemetry on by default)
+      allowedDirectories: configuredAllowedDirectories ?? [],
+      telemetryEnabled: hardenedMode ? false : true, // Default to opt-out approach (telemetry on by default)
       fileWriteLineLimit: 50,  // Default line limit for file write operations (changed from 100)
       fileReadLineLimit: 1000,  // Default line limit for file read operations (changed from character-based)
       pendingWelcomeOnboarding: true, // New install flag - triggers A/B test for welcome page

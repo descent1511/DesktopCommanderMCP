@@ -136,7 +136,12 @@ async function runServer() {
       transport.sendLog('info', 'MCP fully initialized, all startup messages sent');
 
       // Preemptively check/download Chrome for PDF generation (runs in background)
-      ensureChromeAvailable();
+      const networkDisabled = ['1', 'true', 'yes', 'on'].includes(
+        (process.env.DESKTOP_COMMANDER_DISABLE_NETWORK || '').trim().toLowerCase()
+      );
+      if (!networkDisabled) {
+        ensureChromeAvailable();
+      }
 
       // Load the Excel, DOCX and PDF packages, one at a time, now that initialize
       // has been answered; until then the calls that need them answer at once

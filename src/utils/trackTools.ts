@@ -2,10 +2,17 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { TOOL_CALL_FILE, TOOL_CALL_FILE_MAX_SIZE } from '../config.js';
 import { renameWithRetry } from './rename.js';
+import { redactValue } from './redact.js';
+
+const HISTORY_DISABLED = ['1', 'true', 'yes', 'on'].includes(
+  (process.env.DESKTOP_COMMANDER_DISABLE_HISTORY || '').trim().toLowerCase()
+);
 
 // Ensure the directory for the log file exists
-const logDir = path.dirname(TOOL_CALL_FILE);
-await fs.promises.mkdir(logDir, { recursive: true });
+if (!HISTORY_DISABLED) {
+  const logDir = path.dirname(TOOL_CALL_FILE);
+  await fs.promises.mkdir(logDir, { recursive: true });
+}
 
 /**
  * Track tool calls and save them to a log file
@@ -13,12 +20,15 @@ await fs.promises.mkdir(logDir, { recursive: true });
  * @param args Arguments passed to the tool (optional)
  */
 export async function trackToolCall(toolName: string, args?: unknown): Promise<void> {
+  if (HISTORY_DISABLED) return;
+
   try {
     // Get current timestamp
     const timestamp = new Date().toISOString();
     
     // Format the log entry
-    const logEntry = `${timestamp} | ${toolName.padEnd(20, ' ')}${args ? `\t| Arguments: ${JSON.stringify(args)}` : ''}\n`;
+    const safeArgs = redactValue(args);
+    const logEntry = `${timestamp} | ${toolName.padEnd(20, ' ')}${safeArgs ? `\t| Arguments: ${JSON.stringify(safeArgs)}` : ''}\n`;
 
     // Check if file exists and get its size
     let fileSize = 0;

@@ -1,7 +1,8 @@
 import { ServerResult } from '../types.js';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
+import { CONFIG_DIR } from '../config.js';
+import { redactValue, redactServerResult } from './redact.js';
 
 export interface ToolCallRecord {
   timestamp: string;
@@ -31,6 +32,9 @@ function formatLocalTimestamp(isoTimestamp: string): string {
 
 class ToolHistory {
   private history: ToolCallRecord[] = [];
+  private readonly disabled = ['1', 'true', 'yes', 'on'].includes(
+    (process.env.DESKTOP_COMMANDER_DISABLE_HISTORY || '').trim().toLowerCase()
+  );
   private readonly MAX_ENTRIES = 1000;
   /**
    * Cap on the output kept per entry. Entries hold the FULL ServerResult, and
@@ -62,16 +66,17 @@ class ToolHistory {
   private writeInterval?: NodeJS.Timeout;
 
   constructor() {
-    // Store history in same directory as config to keep everything together
-    const historyDir = path.join(os.homedir(), '.claude-server-commander');
+    // Store history beside the selected config, so a hardened instance can use
+    // a disposable/container-local directory instead of the user's home.
+    const historyDir = CONFIG_DIR;
+    this.historyFile = path.join(historyDir, 'tool-history.jsonl');
+
+    if (this.disabled) return;
     
     // Ensure directory exists
     if (!fs.existsSync(historyDir)) {
       fs.mkdirSync(historyDir, { recursive: true });
     }
-    
-    // Use append-only JSONL format (JSON Lines)
-    this.historyFile = path.join(historyDir, 'tool-history.jsonl');
     
     // Load existing history on startup
     this.loadFromDisk();
@@ -272,11 +277,13 @@ class ToolHistory {
     output: ServerResult,
     duration?: number
   ): void {
+    if (this.disabled) return;
+
     const record: ToolCallRecord = {
       timestamp: new Date().toISOString(),
       toolName,
-      arguments: args,
-      output: this.capOutput(output),
+      arguments: redactValue(args),
+      output: this.capOutput(redactServerResult(output)),
       duration
     };
 
@@ -299,6 +306,8 @@ class ToolHistory {
     toolName?: string;
     since?: string;
   }): ToolCallRecord[] {
+    if (this.disabled) return [];
+
     let results = [...this.history];
 
     // Filter by tool name
@@ -338,6 +347,16 @@ class ToolHistory {
    * Get current stats
    */
   getStats() {
+    if (this.disabled) {
+      return {
+        totalEntries: 0,
+        oldestEntry: undefined,
+        newestEntry: undefined,
+        historyFile: this.historyFile,
+        queuedWrites: 0,
+      };
+    }
+
     return {
       totalEntries: this.history.length,
       oldestEntry: this.history[0]?.timestamp,

@@ -41,6 +41,16 @@ class FeatureFlagManager {
    * Initialize - load from cache and start background refresh
    */
   async initialize(): Promise<void> {
+    // Hardened/offline instances must not contact the feature-flag service.
+    // This also keeps the normal async fetch from creating a surprise outbound
+    // request when the MCP process is run outside the Docker network sandbox.
+    if (['1', 'true', 'yes', 'on'].includes(
+      (process.env.DESKTOP_COMMANDER_DISABLE_NETWORK || '').trim().toLowerCase()
+    ) || this.flagUrl === 'file:///dev/null') {
+      logger.debug('Feature flags disabled for this instance');
+      return;
+    }
+
     try {
       // Load from cache immediately (non-blocking)
       await this.loadFromCache();

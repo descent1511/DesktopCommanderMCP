@@ -71,6 +71,7 @@ import { trackToolCall } from './utils/trackTools.js';
 import { usageTracker } from './utils/usageTracker.js';
 import { processDockerPrompt } from './utils/dockerPrompt.js';
 import { toolHistory } from './utils/toolHistory.js';
+import { redactServerResult } from './utils/redact.js';
 import { handleWelcomePageOnboarding, skipWelcomePageOnboarding } from './utils/welcome-onboarding.js';
 
 import { VERSION } from './version.js';
@@ -1425,7 +1426,7 @@ async function handleCallToolRequest(request: CallToolRequest): Promise<ServerRe
         }
 
         // What the client receives (and the history records): facts kept internal are dropped
-        result = withoutInternalFacts(name, result);
+        result = redactServerResult(withoutInternalFacts(name, result));
 
         // Add tool call to history (exclude only get_recent_tool_calls to prevent recursion)
         const duration = Date.now() - startTime;
@@ -1515,7 +1516,7 @@ async function handleCallToolRequest(request: CallToolRequest): Promise<ServerRe
             // Never let the advisory warning break an otherwise-successful call.
         }
 
-        return result;
+        return redactServerResult(result);
     } catch (error) {
         isError = true;
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -1526,10 +1527,10 @@ async function handleCallToolRequest(request: CallToolRequest): Promise<ServerRe
         capture('server_request_error', {
             error: errorMessage
         });
-        return {
+        return redactServerResult({
             content: [{ type: "text", text: `Error: ${errorMessage}` }],
             isError: true,
-        };
+        });
     } finally {
         // Single tool-call telemetry event, fired AFTER execution so it can carry
         // timing. In a finally so it still fires on the hard-crash path (the catch

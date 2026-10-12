@@ -11,6 +11,10 @@ import {
 } from '../config-field-definitions.js';
 
 const ALLOWED_CONFIG_KEYS = new Set(CONFIG_FIELD_KEYS);
+const HARDENED_MODE = ['1', 'true', 'yes', 'on'].includes(
+  (process.env.DESKTOP_COMMANDER_HARDENED || '').trim().toLowerCase()
+);
+const LOCKED_HARDENED_KEYS = new Set(['allowedDirectories', 'blockedCommands', 'telemetryEnabled']);
 
 /**
  * Get the entire config including system information
@@ -105,6 +109,16 @@ export async function setConfigValue(args: unknown) {
           text: `Key "${parsed.data.key}" is not configurable via this tool. Allowed keys: ${[...ALLOWED_CONFIG_KEYS].join(', ')}`
         }],
         isError: true
+      };
+    }
+
+    if (HARDENED_MODE && LOCKED_HARDENED_KEYS.has(parsed.data.key)) {
+      return {
+        content: [{
+          type: "text",
+          text: `Key "${parsed.data.key}" is locked while Desktop Commander is running in hardened mode.`
+        }],
+        isError: true,
       };
     }
 

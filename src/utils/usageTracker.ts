@@ -50,6 +50,9 @@ const TOOL_CATEGORIES = {
 
 // Session timeout (30 minutes of inactivity = new session)
 const SESSION_TIMEOUT = 30 * 60 * 1000;
+const TRACKING_DISABLED = ['1', 'true', 'yes', 'on'].includes(
+  (process.env.DESKTOP_COMMANDER_DISABLE_USAGE_TRACKING || '').trim().toLowerCase()
+);
 
 class UsageTracker {
   private currentSession: UsageSession | null = null;
@@ -80,6 +83,7 @@ class UsageTracker {
    * Get current usage stats from config
    */
   async getStats(): Promise<ToolUsageStats> {
+    if (TRACKING_DISABLED) return this.getDefaultStats();
     // Migrate old nested feedbackGiven to top-level if needed
     const stats = await configManager.getValue('usageStats');
     return stats || this.getDefaultStats();
@@ -139,6 +143,7 @@ class UsageTracker {
    * Track a successful tool call
    */
   async trackSuccess(toolName: string): Promise<ToolUsageStats> {
+    if (TRACKING_DISABLED) return this.getDefaultStats();
     this.updateSession();
     const now = Date.now();
     const category = this.getToolCategory(toolName);
@@ -165,6 +170,7 @@ class UsageTracker {
    * Track a failed tool call
    */
   async trackFailure(toolName: string): Promise<ToolUsageStats> {
+    if (TRACKING_DISABLED) return this.getDefaultStats();
     this.updateSession();
     const now = Date.now();
     const category = this.getToolCategory(toolName);
@@ -191,6 +197,7 @@ class UsageTracker {
    * Check if user should be prompted for feedback based on usage patterns
    */
   async shouldPromptForFeedback(): Promise<boolean> {
+    if (TRACKING_DISABLED) return false;
     // Check feature flag first
     const { featureFlagManager } = await import('./feature-flags.js');
     const feedbackEnabled = featureFlagManager.get('user_surveys', false);
@@ -311,6 +318,7 @@ class UsageTracker {
    * Mark that user was prompted for feedback
    */
   async markFeedbackPrompted(): Promise<void> {
+    if (TRACKING_DISABLED) return;
     const now = Date.now();
     const today = new Date(now).toISOString().split('T')[0];
 
