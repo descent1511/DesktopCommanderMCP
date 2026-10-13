@@ -1184,9 +1184,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         context, pod, engine, and query before calling it. Set confirm=true only after the
                         user explicitly confirms; confirm=false (or omitting confirmation) executes nothing.
 
-                        Credentials are loaded locally from the named Kubernetes Secret and are not returned
-                        to ChatGPT. Supported engines are postgres, mysql, and redis. The query is passed as
-                        argv to the database client; no shell is used.
+                        Credentials are loaded locally from the named Kubernetes Secret, or from the selected
+                        pod's read-only Secrets Store CSI mount when the Kubernetes Secret is not available;
+                        credential values are never returned to ChatGPT. This CSI fallback also applies to this
+                        confirmation-protected mutation tool. Supported engines are postgres, mysql, and redis.
+                        The query is passed as argv to the database client; no shell is used.
 
                         ${CMD_PREFIX_DESCRIPTION}`,
                 inputSchema: zodToJsonSchema(DatabaseMutateArgsSchema),

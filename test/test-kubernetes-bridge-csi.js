@@ -62,7 +62,8 @@ if (separator >= 0 && args[separator + 1] === 'cat') {
 }
 
 if (args.includes('psql')) {
-  if (args.includes('SELECT 2 AS phase1_bridge_fallback')) {
+  if (args.includes('SELECT 2 AS phase1_bridge_fallback')
+    || args.includes('CREATE TABLE csi_backup_test AS SELECT 1')) {
     process.stderr.write('sh: exec: line 0: psql: not found');
     process.exit(127);
   }
@@ -75,7 +76,9 @@ process.exit(2);
 `;
 
 const fakeLocalPsqlSource = String.raw`#!/usr/bin/env node
-process.stdout.write('2\n');
+const args = process.argv.slice(2);
+if (args.includes('CREATE TABLE csi_backup_test AS SELECT 1')) process.stdout.write('CREATE TABLE AS\n');
+else process.stdout.write('2\n');
 `;
 
 function delay(milliseconds) {
@@ -163,6 +166,23 @@ async function run() {
     assert.match(fallback.command, /via host client/);
     assert.match(fallback.output, /2/);
     assert.doesNotMatch(fallback.output, /CSI_PASS|phase1_reader|prod-db\.internal/);
+
+    const mutation = await sendRequest(dir, 'csi-mutation', {
+      mode: 'db_mutate',
+      context: 'prod',
+      namespace: 'default',
+      pod: 'pim-api-abc',
+      container: 'pim-api',
+      engine: 'postgres',
+      secret: 'pim-api-prod',
+      query: 'CREATE TABLE csi_backup_test AS SELECT 1',
+      timeout_ms: 5000,
+      confirm: true,
+    }, child, stderr);
+    assert.equal(mutation.ok, true, JSON.stringify(mutation));
+    assert.match(mutation.command, /confirmed mutation via host client/);
+    assert.match(mutation.output, /CREATE TABLE AS/);
+    assert.doesNotMatch(mutation.output, /CSI_PASS|phase1_reader|prod-db\.internal/);
 
     const callsBeforeRejectedQuery = readFileSync(logPath, 'utf8')
       .trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));

@@ -573,7 +573,7 @@ async function loadDatabaseCredentials(context, request, timeoutMs, { allowCsi =
   } catch (error) {
     const csiMessage = error instanceof Error ? error.message : String(error);
     const secretMessage = secretError instanceof Error ? secretError.message : 'Kubernetes Secret did not contain database credential keys';
-    throw new Error(`Unable to load read-only database credentials from ${request.secret}: ${secretMessage}; CSI fallback: ${csiMessage}`);
+    throw new Error(`Unable to load database credentials from ${request.secret}: ${secretMessage}; CSI fallback: ${csiMessage}`);
   }
 }
 
@@ -726,7 +726,7 @@ async function handleDatabaseRequest(request, context, timeoutMs) {
   if (request.mode === 'db_read' && !databaseReadQueryAllowed(request.engine, request.query)) {
     throw new Error('This database operation is not classified as read-only; use the confirmation-protected database_mutate tool');
   }
-  const credentials = await loadDatabaseCredentials(context, request, timeoutMs, { allowCsi: request.mode === 'db_read' });
+  const credentials = await loadDatabaseCredentials(context, request, timeoutMs, { allowCsi: true });
   const { clientArgs, credentialVariable } = databaseClientInvocation(request, credentials);
   const execArgs = databaseExecPrefix(context, request, credentials.password !== undefined, credentials.container);
 
@@ -743,13 +743,12 @@ async function handleDatabaseRequest(request, context, timeoutMs) {
     ? `${Buffer.from(credentials.password, 'utf8').toString('base64')}\n`
     : undefined;
   const result = await runProcess(kubectlPath(), command, timeoutMs, MAX_OUTPUT_BYTES, credentialInput);
-  if (request.mode === 'db_read'
-    && credentials.container
+  if (credentials.container
     && credentials.host !== '127.0.0.1'
     && databaseClientMissing(request.engine, result)) {
     // Some CSI-backed application images intentionally omit database clients.
-    // Keep the query read-only, but allow the host bridge to use its native
-    // client against the same endpoint without returning the CSI credential.
+    // Keep credentials on the host and use the host-native client against the
+    // same endpoint. Mutations remain confirmation-protected by validateRequest.
     const localResult = await runProcess(
       localDatabaseClientPath(request.engine),
       clientArgs.slice(1),
@@ -758,11 +757,12 @@ async function handleDatabaseRequest(request, context, timeoutMs) {
       undefined,
       databaseClientEnvironment(credentials, credentialVariable),
     );
+    const operationLabel = request.mode === 'db_read' ? 'read-only operation' : 'confirmed mutation';
     return databaseResult(
       localResult,
       context,
       credentials,
-      `database ${request.engine} read-only operation via host client (pod ${request.pod})`,
+      `database ${request.engine} ${operationLabel} via host client (pod ${request.pod})`,
       timeoutMs,
     );
   }
