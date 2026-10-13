@@ -29,6 +29,7 @@ const SERVER_INSTRUCTIONS = `Desktop Commander provides tools for working with t
 - Terminal process tools support shell commands, REPLs, and long-running processes. start_process creates a process session; interact_with_process sends input; read_process_output reads later output; force_terminate ends a session.
 - Search tools are session-based. start_search creates a search session; get_more_search_results reads its results; stop_search ends it early.
 - Absolute paths are generally the most reliable because relative paths depend on the active working directory.
+- Git tools run the local Mac Git binary through a host bridge. Repositories are restricted to the configured Projects/AIRR roots; git_read fetch and every git_mutate action require explicit confirmation before they execute.
 - allowedDirectories and each tool's schema, annotations, and documented constraints define the operational boundaries.`;
 
 import {
@@ -61,6 +62,8 @@ import {
     KubernetesMutateArgsSchema,
     DatabaseReadArgsSchema,
     DatabaseMutateArgsSchema,
+    GitReadArgsSchema,
+    GitMutateArgsSchema,
     toolArgSchemas,
 } from './tools/schemas.js';
 import {
@@ -73,6 +76,7 @@ import { getUsageStats } from './tools/usage.js';
 import { giveFeedbackToDesktopCommander } from './tools/feedback.js';
 import { handleKubernetesMutate, handleKubernetesRead } from './tools/kubernetes.js';
 import { handleDatabaseMutate, handleDatabaseRead } from './tools/database.js';
+import { handleGitMutate, handleGitRead } from './tools/git.js';
 import { trackToolCall } from './utils/trackTools.js';
 import { usageTracker } from './utils/usageTracker.js';
 import { processDockerPrompt } from './utils/dockerPrompt.js';
@@ -1139,14 +1143,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 description: `
                         Run a read-only query against a database reachable from a Kubernetes pod.
 
-                        The bridge uses the Mac's local kubeconfig and retrieves the named Kubernetes
-                        Secret locally; credential values are never returned to ChatGPT. K9s is a UI
-                        over the same Kubernetes access, so provide the Secret name shown there rather
-                        than copying a password into chat.
+                        The bridge uses the Mac's local kubeconfig and retrieves credentials locally;
+                        credential values are never returned to ChatGPT. The secret field may name a
+                        Kubernetes Secret or a Secrets Store CSI SecretProviderClass mounted by the
+                        selected pod. For a CSI source, only the read-only mounted credential file is
+                        inspected inside that pod. K9s is a UI over the same Kubernetes access, so provide
+                        the Secret/SecretProviderClass name shown there rather than copying a password
+                        into chat.
 
-                        Supported engines: postgres, mysql, redis. The query runs inside the selected pod
-                        using its native client (psql, mysql, or redis-cli), with the target host defaulting
-                        to 127.0.0.1 unless host or a host Secret key is supplied.
+                        Supported engines: postgres, mysql, redis. The query normally runs inside the selected
+                        pod using its native client (psql, mysql, or redis-cli), with the target host defaulting
+                        to 127.0.0.1 unless host or a host credential key is supplied. For a CSI-backed
+                        read-only source whose application image lacks the native client, the local bridge
+                        may use its host-native client against the same endpoint; credentials still stay local.
 
                         Only clearly read-only SQL (SELECT/SHOW/DESCRIBE/EXPLAIN) and a safe Redis read
                         command set are accepted here. Use database_mutate for writes, deletes, DDL,
@@ -1183,6 +1192,58 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 inputSchema: zodToJsonSchema(DatabaseMutateArgsSchema),
                 annotations: {
                     title: "Change Database (confirmation required)",
+                    readOnlyHint: false,
+                    openWorldHint: false,
+                    destructiveHint: true,
+                },
+            },
+            {
+                name: "git_read",
+                description: `
+                        Run a controlled read-oriented Git operation on a local Mac repository.
+
+                        The bridge runs Git on the Mac host, while the MCP container sends only a
+                        short-lived request through the local bridge. Use the container-visible repo
+                        path, such as /workspace/repo, /airr/pim, or /pim-ui. The host canonicalizes
+                        the repository and allows only repos below the configured Projects/AIRR roots.
+
+                        Supported actions are status, log, diff, branch, and fetch. status, log, diff,
+                        and branch do not modify the worktree. fetch can contact the configured remote
+                        and update local remote-tracking refs, so it requires confirm=true after the user
+                        explicitly approves that fetch. The bridge blocks Git configuration/repository
+                        overrides and external diff helpers.
+
+                        ${CMD_PREFIX_DESCRIPTION}`,
+                inputSchema: zodToJsonSchema(GitReadArgsSchema),
+                annotations: {
+                    title: "Read Local Git Repository",
+                    // The tool includes fetch, which changes local refs and has a confirmation gate.
+                    readOnlyHint: false,
+                    openWorldHint: false,
+                    destructiveHint: false,
+                },
+            },
+            {
+                name: "git_mutate",
+                description: `
+                        Run an explicitly confirmed Git change on a local Mac repository.
+
+                        Supported actions are add, commit, push, checkout, switch, and merge. The
+                        bridge runs Git on the Mac host and accepts only repositories below the
+                        configured Projects/AIRR roots. Use the container-visible repo path, such as
+                        /workspace/repo, /airr/pim, or /pim-ui.
+
+                        SAFETY REQUIREMENT: This tool can stage files, create commits, push to a remote,
+                        change branches, and merge history. The client must show the exact repository,
+                        action, and arguments to the user and ask for confirmation. Set confirm=true only
+                        after the user explicitly approves; confirm=false or omitting confirmation
+                        executes nothing. Force push, remote deletion, forced branch changes, interactive
+                        commit editors, Git configuration overrides, and external diff helpers are blocked.
+
+                        ${CMD_PREFIX_DESCRIPTION}`,
+                inputSchema: zodToJsonSchema(GitMutateArgsSchema),
+                annotations: {
+                    title: "Change Local Git Repository (confirmation required)",
                     readOnlyHint: false,
                     openWorldHint: false,
                     destructiveHint: true,
@@ -1482,6 +1543,15 @@ async function handleCallToolRequest(request: CallToolRequest): Promise<ServerRe
 
             case "database_mutate":
                 result = await handleDatabaseMutate(args);
+                break;
+
+            // Host-side Git bridge tools
+            case "git_read":
+                result = await handleGitRead(args);
+                break;
+
+            case "git_mutate":
+                result = await handleGitMutate(args);
                 break;
 
             // Note: REPL functionality removed in favor of using general terminal commands

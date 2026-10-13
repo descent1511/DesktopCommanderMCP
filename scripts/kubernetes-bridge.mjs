@@ -37,6 +37,8 @@ const READ_COMMANDS = new Set([
 const DATABASE_ENGINES = new Set(['postgres', 'mysql', 'redis']);
 const DATABASE_NAME_PATTERN = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/;
 const DEFAULT_DATABASE_PORTS = { postgres: 5432, mysql: 3306, redis: 6379 };
+const CSI_SECRETS_STORE_DRIVER = 'secrets-store.csi.k8s.io';
+const MAX_CSI_SECRET_FILE_BYTES = 512 * 1024;
 const DATABASE_READ_SQL = /^(select|show|describe|desc|explain)\b/i;
 const REDIS_READ_COMMANDS = new Set([
   'COMMAND', 'DBSIZE', 'ECHO', 'EXISTS', 'GET', 'HGET', 'HGETALL', 'HEXISTS', 'HLEN',
@@ -224,11 +226,11 @@ function kubectlPath() {
   return 'kubectl';
 }
 
-function runProcess(command, args, timeoutMs, maxBytes = MAX_OUTPUT_BYTES, input) {
+function runProcess(command, args, timeoutMs, maxBytes = MAX_OUTPUT_BYTES, input, environment) {
   return new Promise((resolve) => {
     const child = spawn(command, args, {
       stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
-      env: process.env,
+      env: environment ? { ...process.env, ...environment } : process.env,
     });
     let stdout = '';
     let stderr = '';
@@ -310,66 +312,288 @@ function firstSecretValue(secretDocument, requestedKey, aliases) {
   return undefined;
 }
 
-async function loadDatabaseCredentials(context, request, timeoutMs) {
-  const result = await runProcess(kubectlPath(), [
-    '--context', context,
-    '--namespace', request.namespace,
-    'get', 'secret', request.secret,
-    '--output', 'json',
-  ], Math.min(timeoutMs, 20_000), 512 * 1024);
-  if (result.exitCode !== 0) {
-    throw new Error(`Unable to read Kubernetes Secret ${request.secret}: ${redactText(result.stderr || 'kubectl get secret failed')}`);
+function firstMapValue(values, requestedKey, aliases) {
+  if (requestedKey === '') return undefined;
+  const keys = [...new Set([requestedKey, ...aliases].filter(Boolean))];
+  for (const key of keys) {
+    const value = values?.[key];
+    if (typeof value === 'string' || typeof value === 'number') return String(value);
   }
 
-  let document;
-  try {
-    document = JSON.parse(result.stdout);
-  } catch {
-    throw new Error(`Kubernetes Secret ${request.secret} returned invalid JSON`);
+  // Dotenv files are conventionally uppercase, while the request defaults
+  // follow Kubernetes Secret key names.  Allow case-insensitive matching only
+  // after exact keys have been tried so an explicit key always wins.
+  const entries = values && typeof values === 'object' ? Object.entries(values) : [];
+  for (const key of keys) {
+    const match = entries.find(([candidate]) => candidate.toLowerCase() === key.toLowerCase());
+    if (match && (typeof match[1] === 'string' || typeof match[1] === 'number')) return String(match[1]);
   }
+  return undefined;
+}
 
-  const username = firstSecretValue(document, request.username_key, [
-    'username', 'user', 'postgres-user', 'postgres_username', 'POSTGRES_USER', 'MYSQL_USER', 'DB_USER',
-  ]);
-  const password = firstSecretValue(document, request.password_key, [
-    'password', 'passwd', 'redis-password', 'postgres-password', 'postgres_password', 'POSTGRES_PASSWORD',
-    'MYSQL_PASSWORD', 'DB_PASSWORD',
-  ]);
-  const database = firstSecretValue(document, request.database_key, [
-    'database', 'dbname', 'db-name', 'postgres-db', 'postgres_database', 'POSTGRES_DB', 'MYSQL_DATABASE', 'DB_NAME',
-  ]);
-  const secretHost = firstSecretValue(document, request.host_key, [
-    'host', 'hostname', 'address', ...(request.engine === 'redis' ? ['REDIS_HOST'] : ['DB_HOST', 'POSTGRES_HOST', 'MYSQL_HOST']),
-  ]);
-  const secretPort = firstSecretValue(document, request.port_key, [
-    'port', 'db-port', ...(request.engine === 'redis' ? ['REDIS_PORT'] : ['DB_PORT', 'POSTGRES_PORT', 'MYSQL_PORT']),
-  ]);
-
-  const port = request.port ?? (secretPort && /^\d+$/.test(secretPort) ? Number(secretPort) : DEFAULT_DATABASE_PORTS[request.engine]);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Database port from the request or Secret is invalid');
-
+function databaseCredentialAliases(request) {
+  const isRedis = request.engine === 'redis';
   return {
-    username,
-    password,
-    database,
-    host: request.host || secretHost || '127.0.0.1',
-    port,
+    username: [
+      'username', 'user', 'postgres-user', 'postgres_username', 'POSTGRES_USER', 'MYSQL_USER', 'DB_USER',
+      'AFN_DB_USER', 'OMS_DB_USER', 'PROD_READ_DB_USER', 'SS_USER', 'SINGLESTORE_DB_USER',
+    ],
+    password: [
+      'password', 'passwd', 'redis-password', 'postgres-password', 'postgres_password', 'POSTGRES_PASSWORD',
+      'MYSQL_PASSWORD', 'DB_PASSWORD', 'AFN_DB_PASSWORD', 'OMS_DB_PASSWORD', 'PROD_READ_DB_PASSWORD',
+      'SS_PASSWORD', 'SINGLESTORE_DB_PASSWORD', 'REDIS_PASSWORD',
+    ],
+    database: [
+      'database', 'dbname', 'db-name', 'postgres-db', 'postgres_database', 'POSTGRES_DB', 'MYSQL_DATABASE', 'DB_NAME',
+      'AFN_DB_NAME', 'OMS_DB_NAME', 'PROD_READ_DB_NAME', 'SS_DB', 'SINGLESTORE_DB_NAME', 'REDIS_DB',
+    ],
+    host: [
+      'host', 'hostname', 'address', 'DB_HOST', 'POSTGRES_HOST', 'MYSQL_HOST', 'AFN_DB_HOST', 'OMS_DB_HOST',
+      'PROD_READ_DB_HOST', 'SS_HOST', 'SINGLESTORE_DB_HOST', ...(isRedis ? ['REDIS_HOST'] : []),
+    ],
+    port: [
+      'port', 'db-port', 'DB_PORT', 'POSTGRES_PORT', 'MYSQL_PORT', 'AFN_DB_PORT', 'OMS_DB_PORT',
+      'PROD_READ_DB_PORT', 'SS_PORT', 'SINGLESTORE_DB_PORT', ...(isRedis ? ['REDIS_PORT'] : []),
+    ],
+    sslmode: [
+      'sslmode', 'SSL_MODE', 'DB_SSLMODE', 'POSTGRES_SSLMODE', 'AFN_DB_SSLMODE', 'PROD_READ_DB_SSLMODE',
+    ],
   };
 }
 
-function databaseExecPrefix(context, request, withStdin) {
+function databaseCredentialsFromLookup(request, lookup) {
+  const aliases = databaseCredentialAliases(request);
+  const username = lookup(request.username_key, aliases.username);
+  const password = lookup(request.password_key, aliases.password);
+  const database = lookup(request.database_key, aliases.database);
+  const secretHost = lookup(request.host_key, aliases.host);
+  const secretPort = lookup(request.port_key, aliases.port);
+  const sslmode = lookup(undefined, aliases.sslmode);
+  const port = request.port ?? (secretPort && /^\d+$/.test(secretPort.trim()) ? Number(secretPort.trim()) : DEFAULT_DATABASE_PORTS[request.engine]);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Database port from the request or Secret is invalid');
+
+  return {
+    credentials: {
+      username,
+      password,
+      database,
+      host: request.host || secretHost || '127.0.0.1',
+      port,
+      sslmode,
+    },
+    hasSourceValues: [username, password, database, secretHost, secretPort].some((value) => value !== undefined),
+  };
+}
+
+function parseEnvValue(value) {
+  const trimmed = value.trim();
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return trimmed.slice(1, -1);
+    }
+  }
+  if (trimmed.length >= 2 && trimmed.startsWith("'") && trimmed.endsWith("'")) return trimmed.slice(1, -1).replace(/\\'/g, "'");
+  return trimmed;
+}
+
+function parseMountedCredentialFile(content) {
+  const text = String(content || '').replace(/^\uFEFF/, '');
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  } catch {
+    // The CSI file used by the application is dotenv-style; continue below.
+  }
+
+  const values = {};
+  for (const line of text.split(/\r?\n/)) {
+    let candidate = line.trim();
+    if (!candidate || candidate.startsWith('#')) continue;
+    if (candidate.startsWith('export ')) candidate = candidate.slice('export '.length).trim();
+    const separator = candidate.indexOf('=');
+    if (separator <= 0) continue;
+    const key = candidate.slice(0, separator).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(key)) continue;
+    values[key] = parseEnvValue(candidate.slice(separator + 1));
+  }
+  return values;
+}
+
+function safeCsiFileName(value) {
+  if (typeof value !== 'string') return undefined;
+  const candidate = value.trim().replace(/^['"]|['"]$/g, '');
+  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(candidate) ? candidate : undefined;
+}
+
+function extractCsiObjectFileNames(secretProviderClass, requestedName) {
+  const rawObjects = secretProviderClass?.spec?.parameters?.objects;
+  const candidates = [];
+  const add = (value) => {
+    const fileName = safeCsiFileName(value);
+    if (fileName && !candidates.includes(fileName)) candidates.push(fileName);
+  };
+
+  if (typeof rawObjects === 'string') {
+    for (const match of rawObjects.matchAll(/\bobjectAlias\s*:\s*["']?([^\s"']+)["']?/g)) add(match[1]);
+    for (const match of rawObjects.matchAll(/\bobjectName\s*:\s*["']?([^\s"']+)["']?/g)) {
+      const objectName = match[1].split('/').filter(Boolean).pop();
+      add(objectName);
+    }
+  } else if (Array.isArray(rawObjects)) {
+    for (const object of rawObjects) {
+      if (!object || typeof object !== 'object') continue;
+      add(object.objectAlias);
+      const objectName = typeof object.objectName === 'string' ? object.objectName.split('/').filter(Boolean).pop() : undefined;
+      add(objectName);
+    }
+  }
+
+  // This is also the convention used by the repository's SecretProviderClass
+  // manifests (pim-api-prod -> pim_api_prod). It covers providers that omit
+  // objectAlias from the returned resource.
+  add(requestedName.replace(/-/g, '_'));
+  return candidates.slice(0, 8);
+}
+
+async function getKubernetesJson(context, namespace, args, timeoutMs, description) {
+  const result = await runProcess(kubectlPath(), [
+    '--context', context,
+    '--namespace', namespace,
+    ...args,
+  ], Math.min(timeoutMs, 20_000), 512 * 1024);
+  if (result.exitCode !== 0) {
+    throw new Error(`${description}: ${redactText(result.stderr || 'kubectl request failed')}`);
+  }
+  try {
+    return JSON.parse(result.stdout);
+  } catch {
+    throw new Error(`${description} returned invalid JSON`);
+  }
+}
+
+function findCsiMount(podDocument, request, secretProviderClassName) {
+  const volumes = Array.isArray(podDocument?.spec?.volumes) ? podDocument.spec.volumes : [];
+  const volume = volumes.find((candidate) => candidate?.csi?.driver === CSI_SECRETS_STORE_DRIVER
+    && candidate?.csi?.volumeAttributes?.secretProviderClass === secretProviderClassName);
+  if (!volume) throw new Error(`Pod ${request.pod} has no Secrets Store CSI volume for ${secretProviderClassName}`);
+  if (volume.csi.readOnly === false) throw new Error(`CSI volume for ${secretProviderClassName} is not read-only`);
+
+  const containers = Array.isArray(podDocument?.spec?.containers) ? podDocument.spec.containers : [];
+  for (const container of containers) {
+    if (request.container && container?.name !== request.container) continue;
+    const mount = Array.isArray(container?.volumeMounts)
+      ? container.volumeMounts.find((candidate) => candidate?.name === volume.name)
+      : undefined;
+    if (!mount || typeof mount.mountPath !== 'string' || !mount.mountPath.startsWith('/') || mount.mountPath.includes('\0')) continue;
+    if (mount.readOnly === false) throw new Error(`CSI mount for ${secretProviderClassName} is not read-only`);
+    return { container: container.name, mountPath: mount.mountPath.replace(/\/$/, '') || '/' };
+  }
+  throw new Error(`Pod ${request.pod} does not mount CSI volume ${volume.name} in the selected container`);
+}
+
+function databaseExecPrefix(context, request, withStdin, containerOverride) {
   const args = ['--context', context, '--namespace', request.namespace, 'exec'];
   if (withStdin) args.push('--stdin');
   args.push(request.pod);
-  if (request.container) args.push('--container', request.container);
+  const container = containerOverride || request.container;
+  if (container) args.push('--container', container);
   args.push('--');
   return args;
 }
 
-function credentialShell(variable) {
+async function readCsiMountedFile(context, request, mount, fileName, timeoutMs) {
+  const mountedPath = mount.mountPath === '/' ? `/${fileName}` : `${mount.mountPath}/${fileName}`;
+  const result = await runProcess(kubectlPath(), [
+    ...databaseExecPrefix(context, request, false, mount.container),
+    'cat', '--', mountedPath,
+  ], Math.min(timeoutMs, 20_000), MAX_CSI_SECRET_FILE_BYTES);
+  if (result.exitCode !== 0 || result.timedOut || result.truncated) {
+    throw new Error(`Unable to read CSI-mounted credential file ${fileName} from pod ${request.pod}`);
+  }
+  return result.stdout;
+}
+
+async function loadCsiDatabaseCredentials(context, request, timeoutMs) {
+  const secretProviderClass = await getKubernetesJson(
+    context,
+    request.namespace,
+    ['get', 'secretproviderclass', request.secret, '--output', 'json'],
+    timeoutMs,
+    `Unable to read SecretProviderClass ${request.secret}`,
+  );
+  const pod = await getKubernetesJson(
+    context,
+    request.namespace,
+    ['get', 'pod', request.pod, '--output', 'json'],
+    timeoutMs,
+    `Unable to inspect pod ${request.pod} for CSI credentials`,
+  );
+  const mount = findCsiMount(pod, request, request.secret);
+  const fileNames = extractCsiObjectFileNames(secretProviderClass, request.secret);
+  if (fileNames.length === 0) throw new Error(`SecretProviderClass ${request.secret} has no safe mounted object alias`);
+
+  for (const fileName of fileNames) {
+    let content;
+    try {
+      content = await readCsiMountedFile(context, request, mount, fileName, timeoutMs);
+    } catch {
+      // A SecretProviderClass may contain multiple objects.  Do not include
+      // provider output in the error because it can contain secret material.
+      continue;
+    }
+    const values = parseMountedCredentialFile(content);
+    const result = databaseCredentialsFromLookup(request, (key, aliases) => firstMapValue(values, key, aliases));
+    if (result.hasSourceValues) return { ...result.credentials, container: mount.container };
+  }
+
+  throw new Error(`CSI SecretProviderClass ${request.secret} did not expose database credential keys in its mounted files`);
+}
+
+async function loadDatabaseCredentials(context, request, timeoutMs, { allowCsi = false } = {}) {
+  let secretError;
+  try {
+    const document = await getKubernetesJson(
+      context,
+      request.namespace,
+      ['get', 'secret', request.secret, '--output', 'json'],
+      timeoutMs,
+      `Unable to read Kubernetes Secret ${request.secret}`,
+    );
+    const result = databaseCredentialsFromLookup(request, (key, aliases) => firstSecretValue(document, key, aliases));
+    if (result.hasSourceValues || !allowCsi) return result.credentials;
+  } catch (error) {
+    secretError = error;
+  }
+
+  if (!allowCsi) throw secretError || new Error(`Unable to read Kubernetes Secret ${request.secret}`);
+  try {
+    return await loadCsiDatabaseCredentials(context, request, timeoutMs);
+  } catch (error) {
+    const csiMessage = error instanceof Error ? error.message : String(error);
+    const secretMessage = secretError instanceof Error ? secretError.message : 'Kubernetes Secret did not contain database credential keys';
+    throw new Error(`Unable to load read-only database credentials from ${request.secret}: ${secretMessage}; CSI fallback: ${csiMessage}`);
+  }
+}
+
+function shellQuote(value) {
+  const singleQuote = String.fromCharCode(39);
+  const doubleQuote = String.fromCharCode(34);
+  const escaped = String(value).split(singleQuote).join(`${singleQuote}${doubleQuote}${singleQuote}${doubleQuote}${singleQuote}`);
+  return `${singleQuote}${escaped}${singleQuote}`;
+}
+
+function credentialShell(variable, fixedEnvironment = {}) {
+  const fixedExports = Object.entries(fixedEnvironment)
+    .filter(([key, value]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && typeof value === 'string')
+    .map(([key, value]) => `export ${key}=${shellQuote(value)};`)
+    .join(' ');
   return 'set -eu; IFS= read -r encoded; value="$(printf "%s" "$encoded" | base64 -d 2>/dev/null || printf "%s" "$encoded" | base64 --decode)"; export '
     + variable
-    + '="$value"; unset encoded value; exec "$@"';
+    + '="$value"; unset encoded value; '
+    + fixedExports
+    + ' exec "$@"';
 }
 
 function parseRedisCommand(value) {
@@ -414,35 +638,31 @@ function databaseReadQueryAllowed(engine, query) {
     return true;
   }
   // Only one clearly read-only statement is allowed. This rejects multiple
-  // statements and SELECT ... INTO forms that can write to disk or lock data.
+  // statements, SELECT ... INTO forms that can create/write data, and
+  // EXPLAIN ANALYZE, which executes the underlying query.
   const statement = normalized.replace(/;\s*$/, '').trim();
   return DATABASE_READ_SQL.test(statement)
     && !statement.includes(';')
-    && !/\binto\s+(outfile|dumpfile)\b/i.test(statement)
+    && !/\binto\b/i.test(statement)
+    && !/^explain\s+analyze\b/i.test(statement)
     && !/\bfor\s+(update|share)\b/i.test(statement);
 }
 
 function redactDatabaseOutput(value, credentials) {
   let output = redactText(value);
-  for (const secret of [credentials.password, credentials.username]) {
+  for (const secret of [credentials.password, credentials.username, credentials.host]) {
     if (typeof secret === 'string' && secret.length >= 4) output = output.split(secret).join('[REDACTED:database-credential]');
   }
   return output;
 }
 
-async function handleDatabaseRequest(request, context, timeoutMs) {
-  const credentials = await loadDatabaseCredentials(context, request, timeoutMs);
-  if (request.mode === 'db_read' && !databaseReadQueryAllowed(request.engine, request.query)) {
-    throw new Error('This database operation is not classified as read-only; use the confirmation-protected database_mutate tool');
-  }
-
-  const execArgs = databaseExecPrefix(context, request, credentials.password !== undefined);
+function databaseClientInvocation(request, credentials) {
   let clientArgs;
   let credentialVariable;
   if (request.engine === 'postgres') {
     credentialVariable = 'PGPASSWORD';
-    if (credentials.username) clientArgs = ['psql', '--no-psqlrc', '--tuples-only', '--no-align', '--field-separator', '\\t', '--host', credentials.host, '--port', String(credentials.port), '--username', credentials.username];
-    else clientArgs = ['psql', '--no-psqlrc', '--tuples-only', '--no-align', '--field-separator', '\\t', '--host', credentials.host, '--port', String(credentials.port)];
+    clientArgs = ['psql', '--no-psqlrc', '--tuples-only', '--no-align', '--field-separator', '\\t', '--host', credentials.host, '--port', String(credentials.port)];
+    if (credentials.username) clientArgs.push('--username', credentials.username);
     if (credentials.database) clientArgs.push('--dbname', credentials.database);
     clientArgs.push('--command', request.query);
   } else if (request.engine === 'mysql') {
@@ -456,17 +676,33 @@ async function handleDatabaseRequest(request, context, timeoutMs) {
     clientArgs = ['redis-cli', '--raw', '--no-auth-warning', '-h', credentials.host, '-p', String(credentials.port)];
     clientArgs.push(...parseRedisCommand(request.query));
   }
+  return { clientArgs, credentialVariable };
+}
 
-  // Send the credential over kubectl exec's stdin as base64 instead of putting
-  // it in kubectl's argv or the host process environment. The query itself is
-  // passed as argv to the database client; no shell interpolation is used.
-  const command = credentials.password !== undefined
-    ? [...execArgs, 'sh', '-c', credentialShell(credentialVariable), 'sh', ...clientArgs]
-    : [...execArgs, ...clientArgs];
-  const credentialInput = credentials.password !== undefined
-    ? `${Buffer.from(credentials.password, 'utf8').toString('base64')}\n`
-    : undefined;
-  const result = await runProcess(kubectlPath(), command, timeoutMs, MAX_OUTPUT_BYTES, credentialInput);
+function localDatabaseClientPath(engine) {
+  const envName = {
+    postgres: 'DESKTOP_COMMANDER_DATABASE_PSQL_BIN',
+    mysql: 'DESKTOP_COMMANDER_DATABASE_MYSQL_BIN',
+    redis: 'DESKTOP_COMMANDER_DATABASE_REDIS_CLI_BIN',
+  }[engine];
+  return (envName && process.env[envName]) || ({ postgres: 'psql', mysql: 'mysql', redis: 'redis-cli' }[engine]);
+}
+
+function databaseClientEnvironment(credentials, credentialVariable) {
+  const environment = {};
+  if (credentials.password !== undefined) environment[credentialVariable] = credentials.password;
+  if (credentials.sslmode && credentialVariable === 'PGPASSWORD') environment.PGSSLMODE = credentials.sslmode;
+  return environment;
+}
+
+function databaseClientMissing(engine, result) {
+  if (result.exitCode !== 127 || result.timedOut) return false;
+  const client = { postgres: 'psql', mysql: 'mysql', redis: 'redis-cli' }[engine];
+  const escaped = client.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:\\b${escaped}\\b.*(?:not found|No such file|cannot execute)|(?:not found|command not found).*\\b${escaped}\\b)`, 'i').test(result.stderr);
+}
+
+function databaseResult(result, context, credentials, commandLabel, timeoutMs) {
   const outputParts = [];
   if (result.stdout) outputParts.push(result.stdout);
   if (result.stderr) outputParts.push(`[stderr]\n${result.stderr}`);
@@ -478,12 +714,60 @@ async function handleDatabaseRequest(request, context, timeoutMs) {
   return {
     ok: result.exitCode === 0 && !result.timedOut,
     context,
-    command: `database ${request.engine} operation in pod ${request.pod}`,
+    command: commandLabel,
     exitCode: result.exitCode,
     signal: result.signal,
     output: redactDatabaseOutput(output, credentials),
     timedOut: result.timedOut,
   };
+}
+
+async function handleDatabaseRequest(request, context, timeoutMs) {
+  if (request.mode === 'db_read' && !databaseReadQueryAllowed(request.engine, request.query)) {
+    throw new Error('This database operation is not classified as read-only; use the confirmation-protected database_mutate tool');
+  }
+  const credentials = await loadDatabaseCredentials(context, request, timeoutMs, { allowCsi: request.mode === 'db_read' });
+  const { clientArgs, credentialVariable } = databaseClientInvocation(request, credentials);
+  const execArgs = databaseExecPrefix(context, request, credentials.password !== undefined, credentials.container);
+
+  // Send the credential over kubectl exec's stdin as base64 instead of putting
+  // it in kubectl's argv or the host process environment. The query itself is
+  // passed as argv to the database client; no shell interpolation is used.
+  const fixedEnvironment = credentials.sslmode && request.engine === 'postgres'
+    ? { PGSSLMODE: credentials.sslmode }
+    : {};
+  const command = credentials.password !== undefined
+    ? [...execArgs, 'sh', '-c', credentialShell(credentialVariable, fixedEnvironment), 'sh', ...clientArgs]
+    : [...execArgs, ...clientArgs];
+  const credentialInput = credentials.password !== undefined
+    ? `${Buffer.from(credentials.password, 'utf8').toString('base64')}\n`
+    : undefined;
+  const result = await runProcess(kubectlPath(), command, timeoutMs, MAX_OUTPUT_BYTES, credentialInput);
+  if (request.mode === 'db_read'
+    && credentials.container
+    && credentials.host !== '127.0.0.1'
+    && databaseClientMissing(request.engine, result)) {
+    // Some CSI-backed application images intentionally omit database clients.
+    // Keep the query read-only, but allow the host bridge to use its native
+    // client against the same endpoint without returning the CSI credential.
+    const localResult = await runProcess(
+      localDatabaseClientPath(request.engine),
+      clientArgs.slice(1),
+      timeoutMs,
+      MAX_OUTPUT_BYTES,
+      undefined,
+      databaseClientEnvironment(credentials, credentialVariable),
+    );
+    return databaseResult(
+      localResult,
+      context,
+      credentials,
+      `database ${request.engine} read-only operation via host client (pod ${request.pod})`,
+      timeoutMs,
+    );
+  }
+
+  return databaseResult(result, context, credentials, `database ${request.engine} operation in pod ${request.pod}`, timeoutMs);
 }
 
 async function handleRequest(request) {

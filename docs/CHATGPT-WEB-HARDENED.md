@@ -8,7 +8,15 @@ OpenAI's Secure MCP Tunnel. It does not use Desktop Commander's hosted
 
 The tunnel launches `scripts/run-chatgpt-web-docker.sh`, which:
 
-- mounts only `CHATGPT_WORKSPACE` at `/workspace`;
+- mounts the configured project directory at `/workspace`;
+- mounts `CHATGPT_AIRR_WORKSPACE` at `/airr` (default:
+  `/Users/descent/Documents/AIRR`);
+- mounts `CHATGPT_PIM_WORKSPACE` at `/pim` (default:
+  `/Users/descent/Documents/AIRR/pim`);
+- mounts `CHATGPT_PIM_UI_WORKSPACE` at `/pim-ui` (default:
+  `/Users/descent/Documents/AIRR/pim-ui`);
+- includes the Go 1.24 toolchain and mounts `CHATGPT_GO_MODULE_CACHE`
+  read-only at `/go/pkg/mod` when the host cache exists;
 - runs with `--network=none`, read-only image filesystem, dropped Linux
   capabilities, no-new-privileges, and resource limits;
 - does not mount the host home directory, SSH keys, cloud credentials, or
@@ -19,6 +27,13 @@ The tunnel launches `scripts/run-chatgpt-web-docker.sh`, which:
   and database connection strings in MCP text results and any retained records;
 - locks `allowedDirectories`, `blockedCommands`, and `telemetryEnabled` against
   changes through `set_config_value` while hardened mode is enabled.
+- starts a separate host-side Git bridge. `git_read` exposes status, log, diff,
+  branch, and confirmed fetch; `git_mutate` exposes add, commit, push,
+  checkout/switch, and merge. The bridge maps `/workspace`, `/airr`, `/pim`,
+  and `/pim-ui` to the matching Mac directories and allows repositories only
+  below the Projects/AIRR roots. Force-push, remote deletion, forced branch
+  changes, interactive commit editors, and Git configuration overrides are
+  blocked; all mutations require confirmation.
 
 The container intentionally provides Linux tools, not macOS-native commands.
 The bind-mounted workspace remains writable; all other container files are
@@ -32,7 +47,11 @@ From this repository:
 npm ci --include=dev --no-audit --no-fund
 npm run build
 ./scripts/build-chatgpt-web-image.sh
-CHATGPT_WORKSPACE=/Users/descent/Projects ./scripts/run-chatgpt-web-docker.sh
+CHATGPT_WORKSPACE=/Users/descent/Projects \
+CHATGPT_AIRR_WORKSPACE=/Users/descent/Documents/AIRR \
+CHATGPT_PIM_WORKSPACE=/Users/descent/Documents/AIRR/pim \
+CHATGPT_PIM_UI_WORKSPACE=/Users/descent/Documents/AIRR/pim-ui \
+  ./scripts/run-chatgpt-web-docker.sh
 ```
 
 The last command is an MCP stdio server, so it waits for an MCP client and
@@ -89,4 +108,9 @@ app using the same tunnel and the name above.
 
 Set `CHATGPT_WORKSPACE` in the environment used by the tunnel client to the
 specific project directory you want to expose. The default is
-`/Users/descent/Projects`.
+`/Users/descent/Projects`. Set `CHATGPT_PIM_WORKSPACE` if the PIM directory is
+in a different location; it is mounted separately at `/pim` and is included in
+the hardened allowed-directory list. `CHATGPT_PIM_UI_WORKSPACE` is mounted at
+`/pim-ui` using the same restriction. The parent AIRR directory is also
+available at `/airr`. Go tests use the offline host module cache and an
+ephemeral executable build directory at `/go-tmp`.

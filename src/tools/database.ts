@@ -42,7 +42,10 @@ function validateReadQuery(engine: string, query: string): string | undefined {
 
     // CTEs are deliberately routed through the confirmation-protected tool:
     // WITH ... UPDATE/DELETE/INSERT can mutate even when the first token is WITH.
+    // SELECT INTO and EXPLAIN ANALYZE also execute/write beyond a safe read.
     return /^(select|show|describe|desc|explain)\b/i.test(normalized)
+        && !/\binto\b/i.test(normalized)
+        && !/^explain\s+analyze\b/i.test(normalized)
         ? undefined
         : readOnlyError(engine);
 }

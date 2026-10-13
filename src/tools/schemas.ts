@@ -272,7 +272,7 @@ const DatabaseCommonArgsSchema = {
   pod: KubernetesNameSchema,
   container: KubernetesNameSchema.optional(),
   engine: DatabaseEngineSchema,
-  secret: KubernetesNameSchema,
+  secret: KubernetesNameSchema.describe('Kubernetes Secret name, or Secrets Store CSI SecretProviderClass mounted by the selected pod'),
   query: z.string().min(1).max(100000),
   host: z.string().min(1).max(253).optional(),
   port: z.number().int().min(1).max(65535).optional(),
@@ -290,6 +290,33 @@ export const DatabaseMutateArgsSchema = z.object({
   ...DatabaseCommonArgsSchema,
   // The client should display a destructive confirmation before it sends true.
   confirm: z.boolean().describe('Must be true only after the user explicitly confirms this database change.'),
+});
+
+// Host-side Git bridge schemas.  The repo is expressed using the paths visible
+// inside the ChatGPT container (/workspace, /airr, /pim, /pim-ui); the host
+// bridge maps those aliases back to the corresponding Mac directories.
+const GitRepositorySchema = z.string().min(1).max(4096).describe(
+  'Absolute repository path visible to the container, such as /workspace/repo or /airr/pim',
+);
+const GitArgvSchema = z.array(z.string().min(1).max(2048)).max(80).optional().default([]);
+const GitTimeoutSchema = z.number().int().min(1000).max(120000).optional().default(30000);
+
+export const GitReadArgsSchema = z.object({
+  repo: GitRepositorySchema,
+  action: z.enum(['status', 'log', 'diff', 'branch', 'fetch']),
+  args: GitArgvSchema,
+  timeout_ms: GitTimeoutSchema,
+  // fetch updates local remote-tracking refs and therefore has its own
+  // confirmation gate even though it is exposed by the read tool.
+  confirm: z.boolean().optional().default(false).describe('Required only for fetch; true means the user confirmed updating local remote refs.'),
+});
+
+export const GitMutateArgsSchema = z.object({
+  repo: GitRepositorySchema,
+  action: z.enum(['add', 'commit', 'push', 'checkout', 'switch', 'merge']),
+  args: GitArgvSchema,
+  timeout_ms: GitTimeoutSchema,
+  confirm: z.boolean().optional().default(false).describe('Must be true only after the user explicitly confirms this Git change.'),
 });
 
 /**
@@ -328,4 +355,6 @@ export const toolArgSchemas: Record<string, z.ZodTypeAny> = {
   kubernetes_mutate: KubernetesMutateArgsSchema,
   database_read: DatabaseReadArgsSchema,
   database_mutate: DatabaseMutateArgsSchema,
+  git_read: GitReadArgsSchema,
+  git_mutate: GitMutateArgsSchema,
 };
